@@ -3,7 +3,7 @@
 Three stacked screens in one window:
   1. SubjectScreen   — file dialog + selected-path display.
   2. ScanSelectScreen — list of detected CINE SAX scans (multi-select).
-  3. PreviewScreen   — slice / scan / frame navigation + play/pause.
+  3. PreviewScreen   — slice / frame navigation + play/pause.
 """
 
 from __future__ import annotations
@@ -37,6 +37,8 @@ from PySide6.QtWidgets import (
 )
 
 from cine_preview.pipeline import is_cine_sax_scan, reconstruct_scan, scan_label
+
+_DEFAULT_BROWSE_DIR = r"R:\DataTransfer from ParaVision"
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +120,12 @@ class SubjectScreen(QWidget):
         self._path_label.setWordWrap(True)
         layout.addWidget(self._path_label)
 
+        self._folder_warning = QLabel()
+        self._folder_warning.setStyleSheet("color: darkorange;")
+        self._folder_warning.setWordWrap(True)
+        self._folder_warning.setVisible(False)
+        layout.addWidget(self._folder_warning)
+
         button_row = QHBoxLayout()
         browse_btn = QPushButton("Browse…")
         browse_btn.clicked.connect(self._browse)
@@ -136,16 +144,30 @@ class SubjectScreen(QWidget):
         self._subject_dir = None
         self._path_label.setText("(no folder selected)")
         self._path_label.setStyleSheet("color: gray; padding: 8px; border: 1px solid lightgray;")
+        self._folder_warning.setVisible(False)
         self._next_btn.setEnabled(False)
 
     def _browse(self) -> None:
-        chosen = QFileDialog.getExistingDirectory(self, "Select subject folder")
+        initial_dir = _DEFAULT_BROWSE_DIR if Path(_DEFAULT_BROWSE_DIR).exists() else ""
+        chosen = QFileDialog.getExistingDirectory(self, "Select subject folder", initial_dir)
         if not chosen:
             return
         self._subject_dir = Path(chosen)
         self._path_label.setText(str(self._subject_dir))
         self._path_label.setStyleSheet("padding: 8px; border: 1px solid #888;")
         self._next_btn.setEnabled(True)
+
+        has_numbered_subdirs = any(
+            d.is_dir() and d.name.isdigit() for d in self._subject_dir.iterdir()
+        )
+        if has_numbered_subdirs:
+            self._folder_warning.setVisible(False)
+        else:
+            self._folder_warning.setText(
+                "Warning: this folder does not appear to be a subject folder. "
+                "Expected numbered scan subdirectories (e.g. 1, 2, 3…) inside."
+            )
+            self._folder_warning.setVisible(True)
 
     def _emit_chosen(self) -> None:
         if self._subject_dir is not None:
@@ -181,6 +203,15 @@ class ScanSelectScreen(QWidget):
         back_btn = QPushButton("← Back")
         back_btn.clicked.connect(self.back_requested)
         button_row.addWidget(back_btn)
+
+        select_all_btn = QPushButton("Select all")
+        select_all_btn.clicked.connect(self._select_all)
+        button_row.addWidget(select_all_btn)
+
+        deselect_all_btn = QPushButton("Deselect all")
+        deselect_all_btn.clicked.connect(self._deselect_all)
+        button_row.addWidget(deselect_all_btn)
+
         button_row.addStretch()
 
         self._reconstruct_btn = QPushButton("Reconstruct selected →")
@@ -206,6 +237,14 @@ class ScanSelectScreen(QWidget):
         self._progress.setVisible(False)
         self._set_busy(False)
 
+        numbered_subdirs = [d for d in subject_dir.iterdir() if d.is_dir() and d.name.isdigit()]
+        if not numbered_subdirs:
+            item = QListWidgetItem("(no scan subdirectories found)")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self._list.addItem(item)
+            self._reconstruct_btn.setEnabled(False)
+            return
+
         scan_dirs = sorted(
             (d for d in subject_dir.iterdir() if d.is_dir()),
             key=lambda d: (len(d.name), d.name),
@@ -218,13 +257,27 @@ class ScanSelectScreen(QWidget):
             self._reconstruct_btn.setEnabled(False)
             return
 
-        for scan_dir in cine_dirs:
+        middle_index = len(cine_dirs) // 2
+        for i, scan_dir in enumerate(cine_dirs):
             item = QListWidgetItem(scan_label(scan_dir))
             item.setData(Qt.ItemDataRole.UserRole, str(scan_dir))
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Checked)
+            check_state = Qt.CheckState.Checked if i == middle_index else Qt.CheckState.Unchecked
+            item.setCheckState(check_state)
             self._list.addItem(item)
         self._reconstruct_btn.setEnabled(True)
+
+    def _select_all(self) -> None:
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            if item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                item.setCheckState(Qt.CheckState.Checked)
+
+    def _deselect_all(self) -> None:
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            if item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                item.setCheckState(Qt.CheckState.Unchecked)
 
     def _emit_reconstruct(self) -> None:
         selected: list[Path] = []
@@ -273,8 +326,8 @@ class PreviewScreen(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
-        self._scans: list[ReconstructedScan] = []
-        self._scan_index = 0
+        self._images: npt.NDArray[np.float64] | None = None
+        self._slice_labels: list[str] = []
         self._slice_index = 0
         self._frame_index = 0
 
@@ -300,7 +353,7 @@ class PreviewScreen(QWidget):
         self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self._status)
 
-        # Slice slider
+        # Slice slider — each position corresponds to one segFLASH scan file
         slice_row = QHBoxLayout()
         slice_row.addWidget(QLabel("Slice"))
         self._slice_prev = QPushButton("◀")
@@ -313,20 +366,6 @@ class PreviewScreen(QWidget):
         self._slice_next.clicked.connect(lambda: self._step_slice(1))
         slice_row.addWidget(self._slice_next)
         layout.addLayout(slice_row)
-
-        # Scan slider
-        scan_row = QHBoxLayout()
-        scan_row.addWidget(QLabel("Scan"))
-        self._scan_prev = QPushButton("◀")
-        self._scan_prev.clicked.connect(lambda: self._step_scan(-1))
-        scan_row.addWidget(self._scan_prev)
-        self._scan_slider = QSlider(Qt.Orientation.Horizontal)
-        self._scan_slider.valueChanged.connect(self._on_scan_changed)
-        scan_row.addWidget(self._scan_slider, stretch=1)
-        self._scan_next = QPushButton("▶")
-        self._scan_next.clicked.connect(lambda: self._step_scan(1))
-        scan_row.addWidget(self._scan_next)
-        layout.addLayout(scan_row)
 
         # Frame slider + play/pause
         frame_row = QHBoxLayout()
@@ -359,48 +398,37 @@ class PreviewScreen(QWidget):
     # ---- public API ----------------------------------------------------------
 
     def load_scans(self, scans: list[ReconstructedScan]) -> None:
-        self._scans = scans
-        self._scan_index = 0
+        if not scans:
+            return
+
+        # Each scan is one or more slices; stack all along the slice axis so the
+        # single "slice" slider navigates across all segFLASH scan files.
+        self._images = np.concatenate([s.images for s in scans], axis=2)
+        self._slice_labels = []
+        for scan in scans:
+            n_slices_in_scan = scan.images.shape[2]
+            self._slice_labels.extend([scan.label] * n_slices_in_scan)
+
         self._slice_index = 0
         self._frame_index = 0
 
-        n_scans = len(scans)
-        self._scan_slider.blockSignals(True)
-        self._scan_slider.setRange(0, max(0, n_scans - 1))
-        self._scan_slider.setValue(0)
-        self._scan_slider.setEnabled(n_scans > 1)
-        self._scan_slider.blockSignals(False)
-
-        self._refresh_for_current_scan()
-
-    # ---- slot helpers --------------------------------------------------------
-
-    def _refresh_for_current_scan(self) -> None:
-        if not self._scans:
-            return
-        scan = self._scans[self._scan_index]
-        _, _, n_slices, n_frames = scan.images.shape
-
-        self._slice_index = min(self._slice_index, n_slices - 1)
-        self._frame_index = min(self._frame_index, n_frames - 1)
+        _, _, n_slices, n_frames = self._images.shape
 
         self._slice_slider.blockSignals(True)
         self._slice_slider.setRange(0, max(0, n_slices - 1))
-        self._slice_slider.setValue(self._slice_index)
+        self._slice_slider.setValue(0)
         self._slice_slider.setEnabled(n_slices > 1)
         self._slice_slider.blockSignals(False)
 
         self._frame_slider.blockSignals(True)
         self._frame_slider.setRange(0, max(0, n_frames - 1))
-        self._frame_slider.setValue(self._frame_index)
+        self._frame_slider.setValue(0)
         self._frame_slider.setEnabled(n_frames > 1)
         self._frame_slider.blockSignals(False)
 
         self._update_view()
 
-    def _on_scan_changed(self, value: int) -> None:
-        self._scan_index = value
-        self._refresh_for_current_scan()
+    # ---- slot helpers --------------------------------------------------------
 
     def _on_slice_changed(self, value: int) -> None:
         self._slice_index = value
@@ -410,24 +438,18 @@ class PreviewScreen(QWidget):
         self._frame_index = value
         self._update_view()
 
-    def _step_scan(self, delta: int) -> None:
-        if not self._scans:
-            return
-        new_index = (self._scan_index + delta) % len(self._scans)
-        self._scan_slider.setValue(new_index)
-
     def _step_slice(self, delta: int) -> None:
-        if not self._scans:
+        if self._images is None:
             return
-        n_slices = self._scans[self._scan_index].images.shape[2]
+        n_slices = self._images.shape[2]
         if n_slices == 0:
             return
         self._slice_slider.setValue((self._slice_index + delta) % n_slices)
 
     def _step_frame(self, delta: int) -> None:
-        if not self._scans:
+        if self._images is None:
             return
-        n_frames = self._scans[self._scan_index].images.shape[3]
+        n_frames = self._images.shape[3]
         if n_frames == 0:
             return
         self._frame_slider.setValue((self._frame_index + delta) % n_frames)
@@ -459,11 +481,10 @@ class PreviewScreen(QWidget):
     # ---- rendering -----------------------------------------------------------
 
     def _update_view(self) -> None:
-        if not self._scans:
+        if self._images is None:
             return
-        scan = self._scans[self._scan_index]
-        nx, ny, n_slices, n_frames = scan.images.shape
-        frame = scan.images[:, :, self._slice_index, self._frame_index]
+        nx, ny, n_slices, n_frames = self._images.shape
+        frame = self._images[:, :, self._slice_index, self._frame_index]
 
         pixmap = _array_to_pixmap(frame)
         size = self._image_label.size()
@@ -474,7 +495,8 @@ class PreviewScreen(QWidget):
         )
         self._image_label.setPixmap(scaled)
 
-        self._header.setText(scan.label)
+        label = self._slice_labels[self._slice_index] if self._slice_labels else ""
+        self._header.setText(label)
         self._status.setText(
             f"slice {self._slice_index + 1}/{n_slices}   "
             f"frame {self._frame_index + 1}/{n_frames}   "

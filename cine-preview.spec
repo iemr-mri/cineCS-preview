@@ -1,40 +1,33 @@
-# PyInstaller spec for cine-preview.
-#
-# Builds a single, self-contained Windows .exe that launches the PySide6 GUI.
-#
-# Build with:  .venv\Scripts\python.exe -m PyInstaller cine-preview.spec --noconfirm
-# Output:      dist\cine-preview.exe
+# -*- mode: python ; coding: utf-8 -*-
 
-from PyInstaller.utils.hooks import collect_submodules
 
-# scipy pulls in submodules dynamically; collect them explicitly.
-hidden_imports = collect_submodules("scipy")
-
-analysis = Analysis(
-    ["src/cine_preview/__main__.py"],
-    pathex=["src"],
+a = Analysis(
+    ['src\\cine_preview\\__main__.py'],
+    pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=hidden_imports,
+    hiddenimports=[],
     hookspath=[],
+    hooksconfig={},
     runtime_hooks=[],
-    excludes=["tkinter", "matplotlib", "PySide6.QtWebEngineCore", "PyQt5", "PyQt6"],
+    excludes=[],
     noarchive=False,
+    optimize=0,
 )
-
-pyz = PYZ(analysis.pure)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
-    analysis.scripts,
-    analysis.binaries,
-    analysis.datas,
+    a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    name="cine-preview",
+    name='cine-preview',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=False,
+    upx=True,
+    upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,

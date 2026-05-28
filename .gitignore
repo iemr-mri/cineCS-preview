@@ -33,9 +33,6 @@ share/python-wheels/
 MANIFEST
 
 # PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-#  ieMR-toolbox.spec is tracked deliberately (it is our maintained build recipe).
 *.manifest
 *.spec
 !cineCS-preview.spec
